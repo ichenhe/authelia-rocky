@@ -1,0 +1,122 @@
+# Note: `PAT` secret is required with env var RW permission
+
+name: Build image
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  UPSTREAM_IMAGE: ghcr.io/authelia/authelia
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install skopeo for image inspection
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y skopeo
+
+    - name: Get previous build info
+      id: get-last
+      run: |
+        echo "digest=${{ vars.LAST_UPSTREAM_DIGEST }}" >> $GITHUB_OUTPUT
+        echo "version=${{ vars.LAST_UPSTREAM_VERSION }}" >> $GITHUB_OUTPUT
+
+    - name: Check upstream image digest
+      id: check-upstream
+      run: |
+        # Get upstream digest
+        CURRENT_DIGEST=$(skopeo inspect docker://${{ env.UPSTREAM_IMAGE }}:latest --format "{{.Digest}}")
+        CURRENT_VERSION=$(skopeo inspect docker://${{ env.UPSTREAM_IMAGE }}:latest --format '{{ index .Labels "org.opencontainers.image.version" }}')
+        echo "digest=${CURRENT_DIGEST}" >> $GITHUB_OUTPUT
+        echo "version=${CURRENT_VERSION}" >> $GITHUB_OUTPUT
+        echo "Upstream: ${CURRENT_VERSION} / ${CURRENT_DIGEST}"
+        
+        # Detech digest change
+        STORED_DIGEST="${{ steps.get-last.outputs.digest }}"
+        STORED_VERSION="${{ steps.get-last.outputs.version }}"
+        if [[ "${CURRENT_DIGEST}" != "${STORED_DIGEST}" ]]; then
+          echo "Stored  : $STORED_VERSION / $STORED_DIGEST"
+          echo "Upstream digest change detected"
+          echo "need_build=true" >> $GITHUB_OUTPUT
+        else
+          echo "Upstream digest didn't change, skip"
+          echo "need_build=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Generate tags
+      if: steps.check-upstream.outputs.need_build == 'true'
+      id: generate-tags
+      run: |
+        VERSION="${{ steps.check-upstream.outputs.version }}"
+        echo "Upstream version: ${VERSION}"
+
+        IFS='.' read -r major minor patch <<< "$VERSION"
+        BASE_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+        TAGS="${BASE_TAG}:latest"
+        if [[ -n "$major" ]]; then
+          TAGS="${TAGS},${BASE_TAG}:${major}"
+        fi
+        if [[ -n "$minor" ]]; then
+          TAGS="${TAGS},${BASE_TAG}:${major}.${minor}"
+        fi
+        if [[ -n "$patch" ]]; then
+          TAGS="${TAGS},${BASE_TAG}:${major}.${minor}.${patch}"
+        fi
+
+        echo "Target tags: ${TAGS}"
+        echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+
+    - name: Set up Docker Buildx
+      if: steps.check-upstream.outputs.need_build == 'true'
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      if: steps.check-upstream.outputs.need_build == 'true'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build and push Docker image
+      if: steps.check-upstream.outputs.need_build == 'true'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64,linux/arm/v7
+        pull: true
+        push: true
+        tags: ${{ steps.generate-tags.outputs.tags }}
+        build-args: |
+          UPSTREAM_IMAGE=${{ env.UPSTREAM_IMAGE }}:latest
+
+    - name: Update stored digest
+      if: steps.check-upstream.outputs.need_build == 'true'
+      run: |
+        gh variable set LAST_UPSTREAM_DIGEST --body "${{ steps.check-upstream.outputs.digest }}"
+        gh variable set LAST_UPSTREAM_VERSION --body "${{ steps.check-upstream.outputs.version }}"
+      env:
+        GH_TOKEN: ${{ secrets.PAT }}
+
+    - name: Summary
+      run: |
+        if [[ "${{ steps.check-upstream.outputs.need_build }}" == "true" ]]; then
+          echo "✅ Upstream change detected, built succeed." >> $GITHUB_STEP_SUMMARY
+          echo "🔄 New upstream: \`${{ steps.check-upstream.outputs.version }}\` / \`${{ steps.check-upstream.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "📦 Built tags: \`${{ steps.generate-tags.outputs.tags }}\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "ℹ️ Upstream has no update, skip." >> $GITHUB_STEP_SUMMARY
+        fi
