@@ -1,0 +1,453 @@
+# Usage:
+# Before create the CFN stack, setup required ParamStores in SSM, default param names are:
+# - /Authelia/db/password
+# - /Authelia/session/secret
+# - /Authelia/storage/encrypt_key
+# - /Authelia/user/password
+# - /Authelia/smtp/username
+# - /Authelia/smtp/password
+#
+# And may update ALB listener to add 443 cert after cfn creation.
+
+Description: Chenhe Authelia serverless deployment
+
+Parameters:
+  Image:
+    Type: String 
+    Description: "Authelia image"
+    Default: "ghcr.io/ichenhe/authelia-rocky:4"
+  DBName:
+    Type: String
+    Description: "DB name inside the Postgres DB instance."
+    Default: "authelia"
+    AllowedPattern: "[a-zA-Z0-9]+"
+  DBUsername:
+    Type: String
+    Description: "Master username of the database."
+    Default: "authelia"
+    AllowedPattern: "[a-zA-Z0-9]+"
+  SNSNotificationEmail:
+    Type: String
+    Description: "Email address for alarm notification"
+    Default: "i@chenhe.me"
+  CacheReplicasPerShard:
+    Type: Number 
+    Description: "ReplicasPerNodeGroup for ElastiCache, NumNodeGroups is always 1."
+    Default: 1
+    MinValue: 0
+    MaxValue: 2
+  SmtpHost:
+    Type: String
+    Default: "smtp.mailgun.org"
+  SmtpPort:
+    Type: Number
+    Description: "In most cases, 587 for TLS and 25 for plaintext."
+    Default: 587
+  SmtpSender:
+    Type: String
+    AllowedPattern: "[^<>]+ <[^<>@]+@[^<>@]+>"
+    Default: "Chenhe SSO <authelia@mg.chenhe.me>"
+  DbPasswordParamName:
+    Type: AWS::SSM::Parameter::Name
+    Description: "Param name in SSM ParamStore whose value is the password of db."
+    Default: '/Authelia/db/password'
+  SmtpUsernameParamName:
+    Type: AWS::SSM::Parameter::Name
+    Description: "Param name in SSM ParamStore whose value is the username of SMTP."
+    Default: '/Authelia/smtp/username'
+  SmtpPasswordParamName:
+    Type: AWS::SSM::Parameter::Name
+    Description: "Param name in SSM ParamStore whose value is the password of SMTP."
+    Default: '/Authelia/smtp/password'
+  SessionSecretParamName:
+    Type: AWS::SSM::Parameter::Name
+    Description: "Param name in SSM ParamStore whose value is session secret of Authlia."
+    Default: '/Authelia/session/secret'
+  StorageEncryptKeyParamName:
+    Type: AWS::SSM::Parameter::Name
+    Description: "Param name in SSM ParamStore whose value is storage encrypt key of Authlia."
+    Default: '/Authelia/storage/encrypt_key'
+  UserPasswordParamName:
+    Type: AWS::SSM::Parameter::Name
+    Description: "Param name in SSM ParamStore whose value is user password."
+    Default: '/Authelia/user/password'
+
+Conditions:
+  CacheHasReplica: !Not [ !Equals [ !Ref CacheReplicasPerShard, 0 ] ]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}/VPC
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}/IGW
+  VPCIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref IGW
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select
+        - '0'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}/PublicSubnet1
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - '1'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}/PublicSubnet2
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}/PublicSubnet1 RouteTable
+  PublicSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+  PublicSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+  PublicSubnetDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      GatewayId: !Ref IGW
+      DestinationCidrBlock: 0.0.0.0/0
+
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub "EC subnet group for ${AWS::StackName}-Authelia"
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+  CacheProvisioned:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupDescription: !Sub "Session storage for ${AWS::StackName}-Authelia"
+      CacheNodeType: 'cache.t4g.micro'
+      ClusterMode: disabled
+      Engine: valkey
+      TransitEncryptionEnabled: true
+      TransitEncryptionMode: preferred
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      NumNodeGroups: 1
+      ReplicasPerNodeGroup: !Ref CacheReplicasPerShard
+      AutomaticFailoverEnabled: !If [ CacheHasReplica, true , false ]
+      MultiAZEnabled: !If [ CacheHasReplica, true , false ]
+      AtRestEncryptionEnabled: true
+      AutoMinorVersionUpgrade: true
+
+
+  GithubActionUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub '${AWS::StackName}-GithubAction-${AWS::Region}'
+      Policies:
+        - PolicyName: Default
+          PolicyDocument:
+            Statement:
+              - Action: [ 'ecs:UpdateService', 'ecs:DescribeServices' ]
+                Effect: Allow
+                Resource: !Ref ECSService
+
+  ECSExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ECSExecRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: '2012-10-17'
+  ECSExecRoleDefaultPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: DefaultPolicy
+      Roles:
+          - !Ref ECSExecRole
+      PolicyDocument: 
+        Statement:
+          - Action:
+              - ssm:GetParameters
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/Authelia/*'
+          - Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:CreateLogGroup
+            Effect: Allow
+            Resource: '*'
+
+
+  RDSDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+        DBSubnetGroupName: !Sub ${AWS::StackName}-authelia
+        DBSubnetGroupDescription: For authelia db
+        SubnetIds:
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2 
+  RDSDBCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+        DBClusterIdentifier: !Sub ${AWS::StackName}
+        DatabaseName: !Ref DBName
+        Engine: aurora-postgresql
+        NetworkType: IPV4
+        ServerlessV2ScalingConfiguration:
+          MaxCapacity: 1
+          MinCapacity: 0
+        MasterUsername: !Ref DBUsername
+        MasterUserPassword: !Sub "{{resolve:ssm-secure:${DbPasswordParamName}}}"
+        DBSubnetGroupName: !Ref RDSDBSubnetGroup
+  RDSDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+        DBClusterIdentifier: !Ref RDSDBCluster
+        Engine: aurora-postgresql
+        DBInstanceClass: db.serverless
+        PubliclyAccessible: false
+        AutoMinorVersionUpgrade: true
+
+
+  ECSTaskDefination:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-authelia
+      Cpu: 256
+      Memory: 512
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !Ref ECSExecRole
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [ FARGATE ]
+      ContainerDefinitions:
+        - Name: authelia
+          Image: !Ref Image
+          Essential: true
+          PortMappings:
+            - Name: authelia
+              Protocol: tcp
+              AppProtocol: http
+              ContainerPort: 9091
+              HostPort: 9091
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-create-group: "true"
+              awslogs-group: !Sub "ecs/${AWS::StackName}"
+              awslogs-stream-prefix: "ecs"
+          HealthCheck:
+            Command: [ "CMD-SHELL", "wget -qO- http://localhost:9091/api/health 2> /dev/null | grep -q OK" ]
+            StartPeriod: 30
+            Interval: 10
+            Retries: 6
+          Secrets:
+            - Name: AUTHELIA_SESSION_SECRET
+              ValueFrom: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SessionSecretParamName}'
+            - Name: USERDB_PASSWORD
+              ValueFrom: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${UserPasswordParamName}'
+            - Name: AUTHELIA_STORAGE_ENCRYPTION_KEY
+              ValueFrom: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${StorageEncryptKeyParamName}'
+            - Name: AUTHELIA_STORAGE_POSTGRES_PASSWORD
+              ValueFrom: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DbPasswordParamName}'
+            - Name: AUTHELIA_NOTIFIER_SMTP_USERNAME
+              ValueFrom: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SmtpUsernameParamName}'
+            - Name: AUTHELIA_NOTIFIER_SMTP_PASSWORD
+              ValueFrom: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SmtpPasswordParamName}'
+          Environment:
+            - Name: X_AUTHELIA_CONFIG
+              Value: /etc/authelia/configuration.yml
+            - Name: X_AUTHELIA_CONFIG_BASE64
+              Value: 'dGhlbWU6IGF1dG8KCmRlZmF1bHRfMmZhX21ldGhvZDogInRvdHAiCgpzZXJ2ZXI6CiAgYWRkcmVzczogJ3RjcDovLzAuMC4wLjA6OTA5MS8nCiAgZGlzYWJsZV9oZWFsdGhjaGVjazogdHJ1ZQoKCmxvZzoKICBsZXZlbDogaW5mbwoKCnRvdHA6CiAgaXNzdWVyOiAiYXV0aGVsaWEuY2hlbmhlLm1lIgogIGFsZ29yaXRobTogJ1NIQTEnCiAgcGVyaW9kOiAzMAogIHNrZXc6IDEKICBzZWNyZXRfc2l6ZTogMzIKCgp3ZWJhdXRobjoKICBkaXNhYmxlOiBmYWxzZQogIGRpc3BsYXlfbmFtZTogIkNoZW5oZSBTU08iCgoKaWRlbnRpdHlfdmFsaWRhdGlvbjoKICByZXNldF9wYXNzd29yZDoKICAgIGp3dF9zZWNyZXQ6ICd4dm4xdnBrMm1kcCptZ21AWk1VJwoKCmF1dGhlbnRpY2F0aW9uX2JhY2tlbmQ6CiAgZmlsZToKICAgIHBhdGg6IC9ldGMvYXV0aGVsaWEvdXNlcnMueWFtbAogICAgcGFzc3dvcmQ6CiAgICAgIGFsZ29yaXRobTogYXJnb24yCgoKYWNjZXNzX2NvbnRyb2w6CiAgZGVmYXVsdF9wb2xpY3k6IHR3b19mYWN0b3IKCgpzZXNzaW9uOgogIHNlY3JldDogJ0VOVl9WQVInCgogIGNvb2tpZXM6CiAgICAtIG5hbWU6IGF1dGhlbGlhX3Nlc3Npb24KICAgICAgZG9tYWluOiAnY2hlbmhlLm1lJwogICAgICBhdXRoZWxpYV91cmw6ICdodHRwczovL2F1dGhlbGlhLmNoZW5oZS5tZScKICAgICAgZGVmYXVsdF9yZWRpcmVjdGlvbl91cmw6ICdodHRwczovL2NoZW5oZS5tZS8nCiAgICAgIHNhbWVfc2l0ZTogbGF4CgogIGluYWN0aXZpdHk6ICc1bScKICBleHBpcmF0aW9uOiAnMWgnCiAgcmVtZW1iZXJfbWU6ICcxTScKCgpzdG9yYWdlOgogIGVuY3J5cHRpb25fa2V5OiAiRU5WX1ZBUiIKCgpub3RpZmllcjoKICBkaXNhYmxlX3N0YXJ0dXBfY2hlY2s6IGZhbHNlCg=='
+            - Name: AUTHELIA_SESSION_REDIS_HOST
+              Value: !GetAtt CacheProvisioned.PrimaryEndPoint.Address
+            - Name: AUTHELIA_SESSION_REDIS_PORT
+              Value: !GetAtt CacheProvisioned.PrimaryEndPoint.Port
+            - Name: AUTHELIA_SESSION_REDIS_TLS_SKIP_VERIFY
+              Value: 'true'
+            - Name: USERDB_DISPLAY_NAME
+              Value: 'Chenhe'
+            - Name: USERDB_EMAIL
+              Value: 'i@chenhe.me'
+            - Name: USERDB_USERNAME
+              Value: 'chenhe'
+            - Name: AUTHELIA_STORAGE_POSTGRES_ADDRESS
+              Value: !Sub
+                - "tcp://${host}:${port}"
+                - host: !GetAtt RDSDBCluster.Endpoint.Address
+                  port: !GetAtt RDSDBCluster.Endpoint.Port
+            - Name: AUTHELIA_STORAGE_POSTGRES_DATABASE
+              Value: !Ref DBName
+            - Name: AUTHELIA_STORAGE_POSTGRES_USERNAME
+              Value: !Ref DBUsername
+            - Name: AUTHELIA_STORAGE_POSTGRES_TLS_SERVER_NAME
+              Value: !GetAtt RDSDBCluster.Endpoint.Address
+            - Name: AUTHELIA_STORAGE_POSTGRES_TLS_SKIP_VERIFY
+              Value: 'true'
+            - Name: AUTHELIA_NOTIFIER_SMTP_ADDRESS
+              Value: !Sub "smtp://${SmtpHost}:${SmtpPort}"
+            - Name: AUTHELIA_NOTIFIER_SMTP_SENDER
+              Value: !Ref SmtpSender
+            - Name: AUTHELIA_NOTIFIER_SMTP_TLS_SERVER_NAME
+              Value: !Ref SmtpHost
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}-Authelia
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      TaskDefinition: !Ref ECSTaskDefination
+      LaunchType: FARGATE
+      Cluster: !Ref ECSCluster
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !GetAtt VPC.DefaultSecurityGroup
+      DesiredCount: 1
+      LoadBalancers:
+        - ContainerName: authelia
+          ContainerPort: 9091
+          TargetGroupArn: !Ref ALBTargetGroup
+    DependsOn: 
+      - ALBListener
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+        - !GetAtt VPC.DefaultSecurityGroup # to allow -->|ECS
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${AWS::StackName}-ALB
+      GroupDescription: ALB security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          Description: "Allow all on 80"
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: tcp
+        - CidrIp: 0.0.0.0/0
+          Description: "Allow all on 443"
+          FromPort: 443
+          ToPort: 443
+          IpProtocol: tcp
+      SecurityGroupEgress:
+        - DestinationSecurityGroupId: !GetAtt VPC.DefaultSecurityGroup
+          IpProtocol: -1
+          Description: "ALB to target"
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      TargetType: ip
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 9091
+      IpAddressType: ipv4
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: 'false'
+      HealthCheckPath: '/api/health'
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  NoHealthInstanceSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${AWS::StackName}-No health Authelia instance
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref SNSNotificationEmail
+  NoHealthInstanceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "[Authelia] There's no enough health instance."
+      Namespace: 'AWS/ApplicationELB'
+      MetricName: 'HealthyHostCount'
+      Dimensions:
+        - Name: TargetGroup
+          Value: !GetAtt ALBTargetGroup.TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !GetAtt ALB.LoadBalancerFullName
+      Statistic: Minimum 
+      Period: 60
+      ComparisonOperator: LessThanThreshold
+      Threshold: 1
+      TreatMissingData: ignore
+      Unit: Count
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 5
+      AlarmActions:
+        - !Ref NoHealthInstanceSNSTopic
+      OKActions:
+        - !Ref NoHealthInstanceSNSTopic
+
+
+Outputs:
+  VPC:
+    Description: VPC
+    Value: !Ref VPC
+  ECSTaskDef:
+    Description: ECS TaskDefinition
+    Value: !Ref ECSTaskDefination
+  ALB:
+    Description: Application LoadBalancer
+    Value: !Ref ALB
+  GithubActionUser:
+    Value: !Ref GithubActionUser
